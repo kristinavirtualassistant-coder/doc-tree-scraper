@@ -3,5 +3,6 @@ __pycache__/
 *.py[cod]
 .env
 service_account.json
+secrets.json
 .git
 .DS_Store
