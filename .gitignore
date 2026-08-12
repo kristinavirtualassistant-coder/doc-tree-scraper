@@ -1,0 +1,11 @@
+# Environment & Credential Files
+.env
+*.env
+service_account.json
+secrets.json
+
+# Cache & Environment
+__pycache__/
+*.py[cod]
+venv/
+.DS_Store
