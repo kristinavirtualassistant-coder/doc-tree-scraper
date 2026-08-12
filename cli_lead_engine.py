@@ -1,4 +1,9 @@
+import warnings
+warnings.filterwarnings("ignore")
+
+import argparse
 import json
+import os
 import re
 import sys
 from datetime import datetime
@@ -6,21 +11,20 @@ from urllib.parse import urljoin, urlparse
 import gspread
 import requests
 from bs4 import BeautifulSoup
+from dotenv import load_dotenv
 from schemas import PropertyRecord
 
-SERVICE_ACCOUNT_FILE = "service_account.json"
+load_dotenv()
 
-# Target Google Drive Folder ID
-TARGET_DRIVE_FOLDER_ID = "17h-HBVutvBNwZi9Ui__hYmCtgns-my6V"
+SERVICE_ACCOUNT_FILE = os.getenv("SERVICE_ACCOUNT_FILE", "service_account.json")
+TARGET_DRIVE_FOLDER_ID = os.getenv("TARGET_DRIVE_FOLDER_ID", "17h-HBVutvBNwZi9Ui__hYmCtgns-my6V")
 
-# Headers for Property Lead Sheets
 PROPERTY_HEADERS = [
     "Target Property URL", "APN / Parcel ID", "Property Address",
     "Primary Owner", "Mailing Address", "Total Assessed Value ($)",
     "Annual Tax Amount ($)", "Tax Year", "Delinquent Status", "Geocoding & Payload Data"
 ]
 
-# Headers for Documentation Tree Sheets
 DOC_HEADERS = [
     "Doc Category", "Page Title", "Sub-Section / Tab", 
     "Source URL", "Main Content / Endpoints", "API Parameters / Fields", "Raw Payload Data"
@@ -33,7 +37,6 @@ class SheetManager:
         self.folder_id = folder_id
 
     def create_spreadsheet(self, title: str, headers: list):
-        """Creates 1 dedicated spreadsheet per target URL inside your Google Drive folder."""
         if self.folder_id:
             spreadsheet = self.gc.create(title, folder_id=self.folder_id)
         else:
@@ -54,14 +57,11 @@ def parse_currency(text: str) -> float:
         return 0.0
 
 
-# =====================================================================
-# ENGINE 1: Property Lead Scraper
-# =====================================================================
 def scrape_property_url(url: str) -> PropertyRecord:
     headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
-    print(f"\nFetching property record from: {url}")
+    print(f"Fetching property record from: {url}")
     response = requests.get(url, headers=headers, timeout=20)
     response.raise_for_status()
     soup = BeautifulSoup(response.text, "html.parser")
@@ -112,53 +112,40 @@ def scrape_property_url(url: str) -> PropertyRecord:
     )
 
 
-def run_property_scraper_loop(manager: SheetManager):
-    print("\n--- MODE: Property Lead Extraction ---")
-    while True:
-        url = input("\nEnter Property URL to Scrape (or 'back' to change mode): ").strip()
-        if url.lower() in ["back", "b"]:
-            break
-        if not url.startswith("http"):
-            print("Invalid URL format. Please include http:// or https://")
-            continue
+def run_property_single(manager: SheetManager, url: str) -> bool:
+    try:
+        record = scrape_property_url(url)
+        domain = urlparse(url).netloc.replace("www.", "")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        sheet_title = f"Property Lead - {domain} ({timestamp})"
 
-        try:
-            record = scrape_property_url(url)
-            domain = urlparse(url).netloc.replace("www.", "")
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            sheet_title = f"Property Lead - {domain} ({timestamp})"
+        spreadsheet, sheet = manager.create_spreadsheet(sheet_title, PROPERTY_HEADERS)
 
-            spreadsheet, sheet = manager.create_spreadsheet(sheet_title, PROPERTY_HEADERS)
-
-            row_data = [
-                record.source_url,
-                record.apn or record.parcel_number or "N/A",
-                record.full_address,
-                record.owner_name_primary or "N/A",
-                record.mailing_address or "N/A",
-                record.total_assessed_value,
-                record.tax_amount_annual,
-                record.tax_year or "N/A",
-                record.delinquent_status,
-                json.dumps(record.enrichment_payload)
-            ]
-            sheet.append_row(row_data)
-
-            print(f"[SUCCESS] Created Dedicated Property Sheet in Target Folder: '{sheet_title}'")
-            print(f" - Sheet URL: {spreadsheet.url}")
-            print(f" - Address/Title: {record.full_address}")
-        except Exception as e:
-            print(f"[ERROR] Failed to process property URL {url}: {e}")
+        row_data = [
+            record.source_url,
+            record.apn or record.parcel_number or "N/A",
+            record.full_address,
+            record.owner_name_primary or "N/A",
+            record.mailing_address or "N/A",
+            record.total_assessed_value,
+            record.tax_amount_annual,
+            record.tax_year or "N/A",
+            record.delinquent_status,
+            json.dumps(record.enrichment_payload)
+        ]
+        sheet.append_row(row_data)
+        print(f"[SUCCESS] Created Property Sheet: '{sheet_title}' | URL: {spreadsheet.url}")
+        return True
+    except Exception as e:
+        print(f"[ERROR] Property scraping failed for {url}: {e}")
+        return False
 
 
-# =====================================================================
-# ENGINE 2: Documentation Tree Crawler
-# =====================================================================
 def extract_doc_tree_and_crawl(start_url: str):
     headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
-    print(f"\nFetching documentation root: {start_url}")
+    print(f"Fetching documentation root: {start_url}")
     response = requests.get(start_url, headers=headers, timeout=20)
     response.raise_for_status()
     soup = BeautifulSoup(response.text, "html.parser")
@@ -225,52 +212,39 @@ def extract_doc_tree_and_crawl(start_url: str):
     return doc_records
 
 
-def run_doc_crawler_loop(manager: SheetManager):
-    print("\n--- MODE: Documentation Tree Crawler ---")
-    while True:
-        url = input("\nEnter Documentation Root URL to Crawl (or 'back' to change mode): ").strip()
-        if url.lower() in ["back", "b"]:
-            break
-        if not url.startswith("http"):
-            print("Invalid URL format. Please include http:// or https://")
-            continue
+def run_doc_single(manager: SheetManager, url: str) -> bool:
+    try:
+        records = extract_doc_tree_and_crawl(url)
+        if records:
+            domain = urlparse(url).netloc.replace("www.", "")
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            sheet_title = f"Doc Suite - {domain} ({timestamp})"
 
-        try:
-            records = extract_doc_tree_and_crawl(url)
-            if records:
-                domain = urlparse(url).netloc.replace("www.", "")
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                sheet_title = f"Doc Suite - {domain} ({timestamp})"
-
-                spreadsheet, sheet = manager.create_spreadsheet(sheet_title, DOC_HEADERS)
-
-                rows_to_insert = []
-                for r in records:
-                    rows_to_insert.append([
-                        r["category"],
-                        r["title"],
-                        r["sub_section"],
-                        r["url"],
-                        r["content"],
-                        r["parameters"],
-                        json.dumps({"timestamp": r["timestamp"]})
-                    ])
-
-                sheet.append_rows(rows_to_insert)
-
-                print(f"[SUCCESS] Created Dedicated Doc Suite Sheet in Target Folder: '{sheet_title}'")
-                print(f" - Sheet URL: {spreadsheet.url}")
-                print(f" - Total Pages Extracted: {len(records)}")
-        except Exception as e:
-            print(f"[ERROR] Failed to process doc URL {url}: {e}")
+            spreadsheet, sheet = manager.create_spreadsheet(sheet_title, DOC_HEADERS)
+            rows_to_insert = [
+                [
+                    r["category"],
+                    r["title"],
+                    r["sub_section"],
+                    r["url"],
+                    r["content"],
+                    r["parameters"],
+                    json.dumps({"timestamp": r["timestamp"]})
+                ]
+                for r in records
+            ]
+            sheet.append_rows(rows_to_insert)
+            print(f"[SUCCESS] Created Doc Suite Sheet: '{sheet_title}' | URL: {spreadsheet.url}")
+            return True
+        else:
+            print("[WARNING] No doc pages extracted.")
+            return False
+    except Exception as e:
+        print(f"[ERROR] Doc crawling failed for {url}: {e}")
+        return False
 
 
-# =====================================================================
-# CLI MENU ROUTER
-# =====================================================================
-def main():
-    manager = SheetManager(SERVICE_ACCOUNT_FILE, folder_id=TARGET_DRIVE_FOLDER_ID)
-
+def run_interactive_loop(manager: SheetManager):
     while True:
         print("\n=======================================================")
         print("          UNIFIED LEAD GENERATION CLI ENGINE          ")
@@ -284,14 +258,41 @@ def main():
         choice = input("\nSelect execution mode [1, 2, or q]: ").strip().lower()
 
         if choice == "1":
-            run_property_scraper_loop(manager)
+            while True:
+                url = input("\nEnter Property URL (or 'back'): ").strip()
+                if url.lower() in ["back", "b"]:
+                    break
+                if url.startswith("http"):
+                    run_property_single(manager, url)
         elif choice == "2":
-            run_doc_crawler_loop(manager)
+            while True:
+                url = input("\nEnter Documentation Root URL (or 'back'): ").strip()
+                if url.lower() in ["back", "b"]:
+                    break
+                if url.startswith("http"):
+                    run_doc_single(manager, url)
         elif choice in ["q", "quit", "exit"]:
             print("Shutting down CLI Engine. Goodbye!")
             sys.exit(0)
-        else:
-            print("Invalid selection. Please choose 1, 2, or q.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Unified Lead Generation & Doc Tree Crawler Engine")
+    parser.add_argument("--mode", "-m", choices=["property", "doc", "1", "2"], help="Execution mode: property (1) or doc (2)")
+    parser.add_argument("--url", "-u", help="Target URL to scrape/crawl in headless mode")
+
+    args = parser.parse_args()
+    manager = SheetManager(SERVICE_ACCOUNT_FILE, folder_id=TARGET_DRIVE_FOLDER_ID)
+
+    if args.mode and args.url:
+        print("=== Executing Headless Mode ===")
+        if args.mode in ["property", "1"]:
+            success = run_property_single(manager, args.url)
+        elif args.mode in ["doc", "2"]:
+            success = run_doc_single(manager, args.url)
+        sys.exit(0 if success else 1)
+    else:
+        run_interactive_loop(manager)
 
 
 if __name__ == "__main__":
